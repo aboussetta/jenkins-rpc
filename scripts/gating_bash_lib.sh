@@ -560,6 +560,9 @@ on_remote(){
     rackspace_cloud_password
     rackspace_cloud_tenant_id
     rackspace_cloud_username
+    REPO_KEY
+    REPO_USER
+    REPO_HOST
   )
 
   #Dump env vars which will be required on the remote host
@@ -614,4 +617,87 @@ clone_rpc(){
     git checkout "$ref"
     git submodule update --init
   popd
+}
+
+
+repo_sync(){
+  src="$1"
+  dest="$2"
+  extra_args=${3:-}
+  description="$src to $dest"
+  [[ -d $src ]] || {
+    echo "Src directory $src not found"
+    exit
+  }
+  echo "===== Start: $description  ===="
+  rsync \
+    ${extra_args} \
+    --delay-updates \
+    --recursive \
+    --links \
+    --itemize-changes \
+    --rsh="ssh -i ${key} -o StrictHostKeyChecking=no" \
+    --temp-dir="/tmp" \
+    ${src} ${dest}
+  rc=$?
+  echo "===== End: $description (rc: $rc) ===="
+}
+
+push_artifacts(){
+  # Required Environment Variables:
+  # REPO_KEY - ssh key provided by credentials binding
+  # REPO_USER - user to login to repo server as
+  # REPO_HOST - hostname/ip of repo server
+
+  # Shell Opts
+  set +x # avoid leaking ssh keys
+
+  trap "exit 0" EXIT
+  # The above trap in combination with -u will cause this script to
+  # halt when attempting to read an undefined variable, but it will
+  # still exit 0. Halting on undefined variables is important so
+  # that files don't get rsynced to unexpected locations. Exit 0 is important
+  # so that artifact publishing doesn't cause a job to fail.
+
+  # Vars
+
+  repo_container="$(lxc-ls '.*_repo_'|head -n1)"
+  local_base="/openstack/${repo_container}/repo"
+  remote_base="${REPO_USER}@${REPO_HOST}:/var/www/repo"
+
+  # Main
+
+  [[ -z "${repo_container}" ]] && {
+    echo "No repo container found, quitting"
+    exit 0
+  }
+
+  # Prep key, header and footer are stripped out because line
+  # breaks are lost, easist to remove header and footer, then
+  # convert all spaces to newlines, then add header/footer back in
+  key=$(tempfile)
+  echo "-----BEGIN RSA PRIVATE KEY-----" > $key
+  echo "$REPO_KEY" \
+    |sed -e 's/\s*-----BEGIN RSA PRIVATE KEY-----\s*//' \
+        -e 's/\s*-----END RSA PRIVATE KEY-----\s*//' \
+        -e 's/ /\n/g' >> $key
+  echo "-----END RSA PRIVATE KEY-----" >> $key
+  chmod 600 ${key}
+
+  # The following artifacts are purely additive - nothing must
+  # ever be deleted at the target.
+  repo_sync "${local_base}/pools/" "${remote_base}/pools"
+
+  # We need to skip the index.html file in this copy as that
+  # is one of the unnecessary files produced in the repo-build
+  # prior to Newton.
+  repo_sync "${local_base}/links/" "${remote_base}/links" "--exclude index.html"
+
+  # The following artifacts must be exactly as they look in the
+  # build when it completes. Anything that is on the target that
+  # is not in the build must be removed.
+  repo_sync "${local_base}/venvs/*" "${remote_base}/venvs/" "--delete"
+  repo_sync "${local_base}/os-releases/*" "${remote_base}/os-releases/" "--delete"
+
+  rm $key
 }

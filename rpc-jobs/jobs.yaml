@@ -320,6 +320,14 @@
           name: IMAGE
           default: "{IMAGE}"
           description: "Pattern used to find an image to build the instance for the aio, defaults to 'Ubuntu 14.04 LTS'"
+      - string:
+          name: REPO_HOST
+          default: "{REPO_HOST}"
+          description: "Hostname/ip of repo server to push artifacts to"
+      - string:
+          name: REPO_USER
+          default: "{REPO_USER}"
+          description: "Username to use when pushing artifacts to repo server"
     properties:
       - rpc-openstack-github
     triggers:
@@ -340,7 +348,7 @@
           status-context: '{context}'
     scm:
       - git:
-          url: "{RPC_REPO}"
+          url: "${{RPC_REPO}}"
           branches:
             - "${{sha1}}"
           refspec: "+refs/pull/*:refs/remotes/origin/pr/* +refs/heads/*:refs/remotes/origin/*"
@@ -356,8 +364,19 @@
             . scripts/gating_bash_lib.sh
             managed_aio "{IMAGE}"
     publishers:
-      # archive artifacts - these are files (logs) that are transferred to the
-      # jenkins master and are available after the build has completed
+      # Push artifacts to the repo server.
+      - postbuildscript:
+          script-only-if-succeeded: true
+          builders:
+            - shell: |
+                #!/usr/bin/sudo -E /bin/bash
+                pushd buildscript_repo
+                  . scripts/gating_bash_lib.sh
+                  on_remote push_artifacts
+                popd
+        # Cleanup:
+        #  * Fetch logs from instance to jenkins for archival as build artifacts
+        #  * Delete instance
       - postbuildscript:
           script-only-if-succeeded: false
           builders:
@@ -367,95 +386,7 @@
                   . scripts/gating_bash_lib.sh
                   managed_cleanup
                 popd
-      - postbuildscript:
-          script-only-if-succeeded: true
-          builders:
-            - shell: |
-               #!/usr/bin/sudo -E /bin/bash
 
-               # Required Environment Variables:
-               # REPO_KEY - ssh key provided by credentials binding
-
-               # Required JJB/Jinja template variables
-               # REPO_USER - user to login to repo server as
-               # REPO_HOST - hostname/ip of repo server
-               REPO_USER="{REPO_USER}"
-               REPO_HOST="{REPO_HOST}"
-
-               # Shell Opts
-               set +x # avoid leaking ssh keys
-               set -u # avoid ref before assignment errors
-
-               trap "exit 0" EXIT
-               # The above trap in combination with -u will cause this script to
-               # halt when attempting to read an undefined variable, but it will
-               # still exit 0. Halting on undefined variables is important so
-               # that files don't get rsynced to unexpected locations.
-
-               push(){{
-                 src="$1"
-                 dest="$2"
-                 extra_args=${{3:-}}
-                 description="$src to rpc-repo:$dest"
-                 echo "===== Start: $description  ===="
-                 [[ -d $src ]] || {{
-                   echo "Src directory $src not found"
-                   exit
-                 }}
-                 rsync \
-                   ${{extra_args}} \
-                   --delay-updates \
-                   --recursive \
-                   --links \
-                   --itemize-changes \
-                   --rsh="ssh -i ${{key}} -o StrictHostKeyChecking=no" \
-                   $src \
-                   ${{REPO_USER}}@${{REPO_HOST}}:${{dest}}
-                 rc=$?
-                 echo "===== End: $description (rc: $rc) ===="
-               }}
-
-               # Vars
-
-               repo_container="$(lxc-ls '.*_repo_'|head -n1)"
-               local_base="/openstack/${{repo_container}}/repo"
-               remote_base="/var/www/repo"
-
-               # Main
-
-               [[ -z "${{repo_container}}" ]] && {{
-                 echo "No repo container found, quitting"
-                 exit 0
-               }}
-
-               # Prep key, header and footer are stripped out because line
-               # breaks are lost, easist to remove header and footer, then
-               # convert all spaces to newlines, then add header/footer back in
-               key=$(tempfile)
-               echo "-----BEGIN RSA PRIVATE KEY-----" > $key
-               echo "$REPO_KEY" \
-                 |sed -e 's/\s*-----BEGIN RSA PRIVATE KEY-----\s*//' \
-                      -e 's/\s*-----END RSA PRIVATE KEY-----\s*//' \
-                      -e 's/ /\n/g' >> $key
-               echo "-----END RSA PRIVATE KEY-----" >> $key
-               chmod 600 ${{key}}
-
-               # The following artifacts are purely additive - nothing must
-               # ever be deleted at the target.
-               push "${{local_base}}/pools/" "${{remote_base}}/pools"
-
-               # We need to skip the index.html file in this copy as that
-               # is one of the unnecessary files produced in the repo-build
-               # prior to Newton.
-               push "${{local_base}}/links/" "${{remote_base}}/links" "--exclude index.html"
-
-               # The following artifacts must be exactly as they look in the
-               # build when it completes. Anything that is on the target that
-               # is not in the build must be removed.
-               push "${{local_base}}/venvs/*" "${{remote_base}}/venvs/" "--delete"
-               push "${{local_base}}/os-releases/*" "${{remote_base}}/os-releases/" "--delete"
-
-               rm $key
       - archive:
           artifacts: "archive*/**/*"
           allow-empty: true
